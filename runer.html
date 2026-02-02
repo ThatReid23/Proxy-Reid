@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PyScript App</title>
+
+    <link rel="stylesheet" href="https://pyscript.net/releases/2024.1.1/core.css">
+    <script type="module" src="https://pyscript.net/releases/2024.1.1/core.js"></script>
+</head>
+<body>
+
+    <h1>Python in the Browser</h1>
+    <p>Today's date is: <span id="output"></span></p>
+
+    <script type="py">
+import socket
+import threading
+import select
+import os
+from flask import Flask, request, Response, render_template_string
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, quote_plus, unquote_plus, urlparse
+import logging
+
+# ---------------- TCP PROXY ----------------
+
+def handle_client(client_socket):
+    try:
+        request_data = client_socket.recv(1024)
+        if not request_data:
+            client_socket.close()
+            return
+
+        first_line = request_data.split(b'\n')[0]
+        method = first_line.split(b' ')[0]
+
+        if method == b'CONNECT':
+            handle_https_request(client_socket, request_data)
+        else:
+            handle_http_request(client_socket, request_data)
+    except Exception as e:
+        logging.error(f"Client handling error: {e}")
+        client_socket.close()
+
+def handle_http_request(client_socket, request_data):
+    try:
+        first_line = request_data.decode('ascii', errors='ignore').split('\n')[0]
+        method, url, _ = first_line.split(' ')
+
+        http_pos = url.find("://")
+        temp = url if http_pos == -1 else url[http_pos + 3:]
+
+        port_pos = temp.find(":")
+        webserver_pos = temp.find("/")
+        if webserver_pos == -1:
+            webserver_pos = len(temp)
+
+        if port_pos == -1 or webserver_pos < port_pos:
+            port = 80
+            webserver = temp[:webserver_pos]
+        else:
+            webserver = temp[:port_pos]
+            port = int(temp[port_pos + 1:webserver_pos])
+
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.connect((webserver, port))
+        s.sendall(request_data)
+
+        while True:
+            data = s.recv(4096)
+            if not data:
+                break
+            client_socket.sendall(data)
+
+        s.close()
+        client_socket.close()
+    except Exception as e:
+        logging.error(f"HTTP proxy error: {e}")
+        client_socket.close()
+
+def handle_https_request(client_socket, request_data):
+    s = None
+    try:
+        first_line = request_data.split(b'\n')[0]
+        host_port = first_line.split(b' ')[1]
+        host, port = host_port.split(b':')
+
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.connect((host.decode(), int(port)))
+        client_socket.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+
+        sockets = [client_socket, s]
+        
+        while True:
+            # Updated with your improved error handling for reset connections
+            try:
+                readable, _, exceptional = select.select(sockets, [], sockets, 10)
+                if exceptional:
+                    break
+                for sock in readable:
+                    data = sock.recv(4096)
+                    if not data:
+                        return # Triggers 'finally' block
+                    
+                    # Determine target socket
+                    other_sock = s if sock is client_socket else client_socket
+                    other_sock.sendall(data)
+            except (ConnectionResetError, ConnectionAbortedError):
+                logging.warning("Connection reset by peer.")
+                break
+                
+    except Exception as e:
+        logging.error(f"HTTPS proxy error: {e}")
+    finally:
+        client_socket.close()
+        if s:
+            s.close()
+
+def start_proxy_server(host="127.0.0.1", port=6767):
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((host, port))
+    server.listen(5)
+    logging.info(f"[*] TCP Proxy listening on {host}:{port}")
+
+    while True:
+        client_socket, addr = server.accept()
+        threading.Thread(
+            target=handle_client,
+            args=(client_socket,),
+            daemon=True
+        ).start()
+
+# ---------------- FLASK WEB PROXY ----------------
+
+app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
+
+PROXY_BACKEND = {
+    "http": "http://127.0.0.1:6767",
+    "https": "http://127.0.0.1:6767"
+}
+
+def rewrite_html(base_url, html_text):
+    soup = BeautifulSoup(html_text, "html.parser")
+
+    def proxify(raw_url):
+        if not raw_url:
+            return raw_url
+        raw_url = raw_url.strip()
+        if raw_url.startswith(("#", "mailto:", "javascript:", "data:", "/proxy?url=")):
+            return raw_url
+        absolute = urljoin(base_url, raw_url)
+        return f"/proxy?url={quote_plus(absolute)}"
+
+    for tag in soup.find_all(href=True):
+        tag["href"] = proxify(tag["href"])
+    for tag in soup.find_all(src=True):
+        tag["src"] = proxify(tag["src"])
+    for tag in soup.find_all("form", action=True):
+        tag["action"] = proxify(tag["action"])
+
+    return str(soup)
+
+@app.route("/")
+def index():
+    games_html_path = os.path.join(os.path.dirname(__file__), "games.html")
+    try:
+        with open(games_html_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        return render_template_string(content)
+    except FileNotFoundError:
+        return "games.html not found.", 404
+
+@app.route("/performance")
+def performance_dummy():
+    return "", 204
+
+@app.route("/proxy", methods=["GET", "POST"])
+def proxy():
+    if request.method == "POST" and "url" in request.form:
+        url = request.form["url"]
+    elif "url" in request.args:
+        url = request.args.get("url")
+    elif "q" in request.args:
+        url = f"https://www.google.com/search?q={quote_plus(request.args.get('q'))}"
+    else:
+        return "No URL provided", 400
+
+    url = unquote_plus(url)
+    if not urlparse(url).scheme:
+        url = "http://" + url
+
+    try:
+        resp = requests.get(
+            url,
+            stream=True,
+            timeout=20,
+            proxies=PROXY_BACKEND,
+            allow_redirects=True
+        )
+        resp.raise_for_status()
+        content_type = resp.headers.get("content-type", "").lower()
+
+        if "text/html" in content_type:
+            html = resp.content.decode("utf-8", errors="replace")
+            parsed = urlparse(url)
+            
+            # Updated base_url logic to ensure proper directory trailing slashes
+            path = parsed.path
+            if not path.endswith('/'):
+                path = os.path.dirname(path)
+            if not path.endswith('/'):
+                path += '/'
+            base_url = f"{parsed.scheme}://{parsed.netloc}{path}"
+            
+            return Response(
+                rewrite_html(base_url, html),
+                content_type="text/html; charset=utf-8"
+            )
+
+        return Response(resp.iter_content(8192), content_type=content_type)
+
+    except Exception as e:
+        return f"Proxy error: {e}", 500
+
+# ---------------- ENTRY POINT ----------------
+
+if __name__ == "__main__":
+    PROXY_PORT = 6767
+    FLASK_PORT = 5000
+
+    threading.Thread(
+        target=start_proxy_server,
+        args=("127.0.0.1", PROXY_PORT),
+        daemon=True
+    ).start()
+
+    app.run(
+        host="127.0.0.1",
+        port=FLASK_PORT,
+        threaded=True,
+        use_reloader=False
+    )
+    </script>
+
+</body>
+</html>
